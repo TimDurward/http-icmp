@@ -1,0 +1,5 @@
+package: github.com/timdurward/http-icmp
+import:
+- package: github.com/gorilla/mux
+  version: ^1.6.1
+- package: github.com/sparrc/go-ping
