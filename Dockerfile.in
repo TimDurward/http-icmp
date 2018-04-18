@@ -1,0 +1,10 @@
+FROM ARG_FROM
+
+LABEL maintainer="timothy.a.durward@gmail.com"
+
+RUN apk add --no-cache curl
+
+ADD bin/ARG_ARCH/ARG_BIN /ARG_BIN
+
+USER nobody:nobody
+ENTRYPOINT ["/ARG_BIN"]

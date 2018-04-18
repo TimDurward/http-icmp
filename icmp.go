@@ -62,7 +62,10 @@ func icmp(host string, count int) Ping {
 	p.Count = count
 	p.Interval = time.Second
 	p.Timeout = time.Second * 100000
-	p.SetPrivileged(false)
+
+	// TODO: Manage environment variables
+
+	p.SetPrivileged(true)
 
 	p.OnFinish = func(stats *ping.Statistics) {
 

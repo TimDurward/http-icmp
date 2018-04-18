@@ -1,46 +1,155 @@
-TEST?=$$(go list ./... |grep -v 'vendor')
-GOFMT_FILES?=$$(find . -name '*.go' |grep -v vendor)
 
-default: build
+# The binary to build.
+BIN := http-icmp
 
-build: fmtcheck
-	go install
+# This repo's root import path (under GOPATH).
+PKG := github.com/timdurward/http-icmp
 
-test: fmtcheck
-	go test -i $(TEST) || exit 1
-	echo $(TEST) | \
-		xargs -t -n4 go test $(TESTARGS) -timeout=30s -parallel=4
+# Where to push the docker image.
+REGISTRY ?= timdurward
 
-testacc: fmtcheck
-	TF_ACC_IDONLY=1 TF_ACC=1 go test $(TEST) -v $(TESTARGS) -timeout 120m
+# Which architecture to build - see $(ALL_ARCH) for options.
+ARCH ?= amd64
 
-vet:
-	@echo "go vet ."
-	@go vet $$(go list ./... | grep -v vendor/) ; if [ $$? -eq 1 ]; then \
-		echo ""; \
-		echo "Vet found suspicious constructs. Please check the reported constructs"; \
-		echo "and fix them if necessary before submitting the code for review."; \
-		exit 1; \
-	fi
+# This version-strategy uses git tags to set the version string
+VERSION := $(shell git describe --tags --always --dirty)
+#
+# This version-strategy uses a manual value to set the version string
+#VERSION := 1.2.3
 
-fmt:
-	gofmt -w $(GOFMT_FILES)
+SRC_DIRS := cmd pkg # directories which hold app source (not vendored)
 
-fmtcheck:
-	@sh -c "'$(CURDIR)/scripts/gofmtcheck.sh'"
+ALL_ARCH := amd64 arm arm64 ppc64le
 
-errcheck:
-	@sh -c "'$(CURDIR)/scripts/errcheck.sh'"
+# Set default base image dynamically for each arch
+ifeq ($(ARCH),amd64)
+    BASEIMAGE?=alpine
+endif
+ifeq ($(ARCH),arm)
+    BASEIMAGE?=armel/busybox
+endif
+ifeq ($(ARCH),arm64)
+    BASEIMAGE?=aarch64/busybox
+endif
+ifeq ($(ARCH),ppc64le)
+    BASEIMAGE?=ppc64le/busybox
+endif
 
-vendor-status:
-	@govendor status
+IMAGE := $(REGISTRY)/$(BIN)-$(ARCH)
 
-test-compile:
-	@if [ "$(TEST)" = "./..." ]; then \
-		echo "ERROR: Set TEST to a specific package. For example,"; \
-		echo "  make test-compile TEST=./aws"; \
-		exit 1; \
-	fi
-	go test -c $(TEST) $(TESTARGS)
+BUILD_IMAGE ?= golang:1.9-alpine
 
-.PHONY: build test testacc vet fmt fmtcheck errcheck vendor-status test-compile
+# If you want to build all binaries, see the 'all-build' rule.
+# If you want to build all containers, see the 'all-container' rule.
+# If you want to build AND push all containers, see the 'all-push' rule.
+all: build
+
+build-%:
+	@$(MAKE) --no-print-directory ARCH=$* build
+
+container-%:
+	@$(MAKE) --no-print-directory ARCH=$* container
+
+push-%:
+	@$(MAKE) --no-print-directory ARCH=$* push
+
+all-build: $(addprefix build-, $(ALL_ARCH))
+
+all-container: $(addprefix container-, $(ALL_ARCH))
+
+all-push: $(addprefix push-, $(ALL_ARCH))
+
+build: bin/$(ARCH)/$(BIN)
+
+bin/$(ARCH)/$(BIN): build-dirs
+	@echo "building: $@"
+	@docker run                                                             \
+	    -ti                                                                 \
+	    --rm                                                                \
+	    -u $$(id -u):$$(id -g)                                              \
+	    -v "$$(pwd)/.go:/go"                                                \
+	    -v "$$(pwd):/go/src/$(PKG)"                                         \
+	    -v "$$(pwd)/bin/$(ARCH):/go/bin"                                    \
+	    -v "$$(pwd)/bin/$(ARCH):/go/bin/$$(go env GOOS)_$(ARCH)"            \
+	    -v "$$(pwd)/.go/std/$(ARCH):/usr/local/go/pkg/linux_$(ARCH)_static" \
+	    -w /go/src/$(PKG)                                                   \
+	    $(BUILD_IMAGE)                                                      \
+	    /bin/sh -c "                                                        \
+	        ARCH=$(ARCH)                                                    \
+	        VERSION=$(VERSION)                                              \
+	        PKG=$(PKG)                                                      \
+	        ./build/build.sh                                                \
+	    "
+
+# Example: make shell CMD="-c 'date > datefile'"
+shell: build-dirs
+	@echo "launching a shell in the containerized build environment"
+	@docker run                                                             \
+	    -ti                                                                 \
+	    --rm                                                                \
+	    -u $$(id -u):$$(id -g)                                              \
+	    -v "$$(pwd)/.go:/go"                                                \
+	    -v "$$(pwd):/go/src/$(PKG)"                                         \
+	    -v "$$(pwd)/bin/$(ARCH):/go/bin"                                    \
+	    -v "$$(pwd)/bin/$(ARCH):/go/bin/$$(go env GOOS)_$(ARCH)"            \
+	    -v "$$(pwd)/.go/std/$(ARCH):/usr/local/go/pkg/linux_$(ARCH)_static" \
+	    -w /go/src/$(PKG)                                                   \
+	    $(BUILD_IMAGE)                                                      \
+	    /bin/sh $(CMD)
+
+DOTFILE_IMAGE = $(subst :,_,$(subst /,_,$(IMAGE))-$(VERSION))
+
+container: .container-$(DOTFILE_IMAGE) container-name
+.container-$(DOTFILE_IMAGE): bin/$(ARCH)/$(BIN) Dockerfile.in
+	@sed \
+	    -e 's|ARG_BIN|$(BIN)|g' \
+	    -e 's|ARG_ARCH|$(ARCH)|g' \
+	    -e 's|ARG_FROM|$(BASEIMAGE)|g' \
+	    Dockerfile.in > .dockerfile-$(ARCH)
+	@docker build -t $(IMAGE):$(VERSION) -f .dockerfile-$(ARCH) .
+	@docker images -q $(IMAGE):$(VERSION) > $@
+
+container-name:
+	@echo "container: $(IMAGE):$(VERSION)"
+
+push: .push-$(DOTFILE_IMAGE) push-name
+.push-$(DOTFILE_IMAGE): .container-$(DOTFILE_IMAGE)
+ifeq ($(findstring gcr.io,$(REGISTRY)),gcr.io)
+	@gcloud docker -- push $(IMAGE):$(VERSION)
+else
+	@docker push $(IMAGE):$(VERSION)
+endif
+	@docker images -q $(IMAGE):$(VERSION) > $@
+
+push-name:
+	@echo "pushed: $(IMAGE):$(VERSION)"
+
+version:
+	@echo $(VERSION)
+
+test: build-dirs
+	@docker run                                                             \
+	    -ti                                                                 \
+	    --rm                                                                \
+	    -u $$(id -u):$$(id -g)                                              \
+	    -v "$$(pwd)/.go:/go"                                                \
+	    -v "$$(pwd):/go/src/$(PKG)"                                         \
+	    -v "$$(pwd)/bin/$(ARCH):/go/bin"                                    \
+	    -v "$$(pwd)/.go/std/$(ARCH):/usr/local/go/pkg/linux_$(ARCH)_static" \
+	    -w /go/src/$(PKG)                                                   \
+	    $(BUILD_IMAGE)                                                      \
+	    /bin/sh -c "                                                        \
+	        ./build/test.sh $(SRC_DIRS)                                     \
+	    "
+
+build-dirs:
+	@mkdir -p bin/$(ARCH)
+	@mkdir -p .go/src/$(PKG) .go/pkg .go/bin .go/std/$(ARCH)
+
+clean: container-clean bin-clean
+
+container-clean:
+	rm -rf .container-* .dockerfile-* .push-*
+
+bin-clean:
+	rm -rf .go bin
